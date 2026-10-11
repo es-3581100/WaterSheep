@@ -103,6 +103,9 @@ def clean_env(cfg) -> None:
 
 
 def run_teacher(cfg, man, reg, h) -> dict:
+    if not cfg.use_public_sources and cfg.synth_target <= 0:
+        LOG.info("teacher skipped: local-record-only training with synth_target=0")
+        return {"skipped": "local-record-only"}
     from ..core.pool import pool_map
     from ..synth.generate import make_example
     from ..data.taxonomy import job
@@ -460,7 +463,11 @@ def run_describe(cfg, man, reg, h) -> dict:
     from ..data.dataset import raw_file, synth_records
     from ..data.sources import enabled
     names = [s.name for s in enabled(cfg) if raw_file(s.name).exists()]
-    return describe.run(cfg, llm.get_teacher(cfg), names, synth_records())
+    synth = list(synth_records())
+    if not names and not synth:
+        LOG.info("describe skipped: no public or synthetic records")
+        return {"skipped": True, "label_sets": 0, "scales": 0, "criteria": 0}
+    return describe.run(cfg, llm.get_teacher(cfg), names, synth)
 
 
 def clean_describe(cfg) -> None:
