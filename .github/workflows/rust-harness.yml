@@ -1,0 +1,45 @@
+name: Rust harness
+
+on:
+  pull_request:
+    paths:
+      - "rust-harness/**"
+      - "go-bridge/**"
+      - "tools/pybundle/**"
+      - ".github/workflows/rust-harness.yml"
+  push:
+    branches: [main]
+    paths:
+      - "rust-harness/**"
+      - "go-bridge/**"
+      - "tools/pybundle/**"
+      - ".github/workflows/rust-harness.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  native-go-wasm-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+      - name: Native Rust tests
+        run: cargo test --manifest-path rust-harness/Cargo.toml
+      - name: Go supervisor tests
+        working-directory: go-bridge
+        run: go test ./...
+      - name: End-to-end fixture smoke
+        run: python3 tools/pybundle/watersheep_bundle.py --smoke --dev
+      - name: WASM check
+        run: >-
+          cargo check
+          --manifest-path rust-harness/Cargo.toml
+          --target wasm32-unknown-unknown
+          --no-default-features
+          --features wasm
