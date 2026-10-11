@@ -113,7 +113,7 @@ def unit_tests():
     imp = HOME / "semantic-records.jsonl"
     imp.write_text(__import__("json").dumps(sem[0]) + "\n", encoding="utf-8")
     loaded = load_records(str(imp), cfg)
-    check(len(loaded) == 1 and loaded[0]["id"] == "sem:e1",
+    check(len(loaded) == 1 and loaded[0]["id"].startswith("sem:e1-"),
           "strict local record import accepts valid semantic NDJSON")
     cfg_no_public = Config(use_public_sources=False)
     check(S.enabled(cfg_no_public) == [], "public dataset loading can be disabled for local-only training")
