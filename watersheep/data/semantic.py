@@ -46,6 +46,7 @@ def graph_records(nodes: List[dict], edges: List[dict], cfg=None, *, negatives: 
     by_id: Dict[str, dict] = {str(n.get("id")): n for n in nodes if n.get("id") is not None}
     ids = sorted(by_id)
     out: List[dict] = []
+    seen_keys = set()
     for edge in edges:
         sid, tid = str(edge.get("source", "")), str(edge.get("target", ""))
         if sid not in by_id or tid not in by_id or sid == tid:
@@ -56,8 +57,14 @@ def graph_records(nodes: List[dict], edges: List[dict], cfg=None, *, negatives: 
                 (not tgt_class or _text(by_id[i], "cluster", "type") == tgt_class)]
         if len(pool) < negatives:
             pool += [i for i in ids if i not in (sid, tid) and i not in pool]
-        edge_id = str(edge.get("id") or "%s>%s>%s" % (sid, edge.get("relation", ""), tid))
-        rng = random.Random(stable_int("%s:%s" % (seed, edge_id)))
+        relation = _text(edge, "relation") or "related_to"
+        edge_key = "%s|%s|%s" % (sid, relation, tid)
+        if edge_key in seen_keys:
+            continue
+        seen_keys.add(edge_key)
+        source_edge_id = str(edge.get("id") or "")
+        edge_id = ("%s-" % source_edge_id if source_edge_id else "") + ("%016x" % stable_int(edge_key))[:10]
+        rng = random.Random(stable_int("%s:%s" % (seed, edge_key)))
         chosen = rng.sample(pool, min(max(0, negatives), len(pool)))
         option_ids = [tid] + chosen
         rng.shuffle(option_ids)
@@ -76,10 +83,11 @@ def graph_records(nodes: List[dict], edges: List[dict], cfg=None, *, negatives: 
             cfg,
             meta={
                 "semantic_task": "relation_completion",
-                "edge_id": edge_id,
+                "edge_id": source_edge_id,
+                "edge_key": edge_key,
                 "source_node_id": sid,
                 "target_node_id": tid,
-                "relation": _text(edge, "relation") or "related_to",
+                "relation": relation,
                 "relation_kind": _text(edge, "kind"),
                 "directed": bool(edge.get("directed", True)),
             },
