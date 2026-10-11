@@ -1,3 +1,26 @@
+> ## Heritage & scope
+>
+> **Upstream:** [SamratDuttaOfficial/WaterSheep](https://github.com/SamratDuttaOfficial/WaterSheep) is the original WaterSheep project. If you like or use work from this lineage, please star and credit the original project.
+>
+> **This repository:** `es-3581100/WaterSheep` is the **non-KoL experimental core fork**. It exists for general WaterSheep model, calibration, training, inference, evaluation, and portability experiments.
+>
+> **Downstream specialization:** [donCannoli-burns/KOL-WaterSheep](https://github.com/donCannoli-burns/KOL-WaterSheep) is a KoL-specific downstream fork of this repository.
+>
+> Lineage:
+>
+> ```text
+> SamratDuttaOfficial/WaterSheep
+>              ↓
+>       es-3581100/WaterSheep        ← non-KoL experimental core
+>              ↓
+> donCannoli-burns/KOL-WaterSheep    ← KoL-specific downstream work
+> ```
+>
+> **Flow rule:** general, domain-neutral model improvements may be inherited into this core from either upstream or downstream work, but **direct or indirect Kingdom of Loathing / KoLmafia content must not flow back into this repository**. No KoL examples, prompts, labels, schemas, routing taxonomies, traces, synthetic derivatives, domain fixtures, or other KoL-derived content belong here. Any backported result must be demonstrably model-level and domain-neutral.
+>
+> KoL-specific work belongs in `donCannoli-burns/KOL-WaterSheep`; this repository stays clean as the general experimental core.
+
+
 ![WaterSheep](assets/banner.svg)
 
 # ![](assets/logo.svg) WaterSheep
