@@ -1,0 +1,33 @@
+name: Rust harness
+
+on:
+  pull_request:
+    paths:
+      - "rust-harness/**"
+      - ".github/workflows/rust-harness.yml"
+  push:
+    branches: [main]
+    paths:
+      - "rust-harness/**"
+      - ".github/workflows/rust-harness.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  native-and-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Native tests
+        run: cargo test --manifest-path rust-harness/Cargo.toml
+      - name: WASM check
+        run: >-
+          cargo check
+          --manifest-path rust-harness/Cargo.toml
+          --target wasm32-unknown-unknown
+          --no-default-features
+          --features wasm
