@@ -25,7 +25,9 @@ class Config:
 
     sources: List[str] = field(default_factory=list)  # empty = all
     exclude_sources: List[str] = field(default_factory=list)
+    use_public_sources: bool = True
     use_kaggle: bool = True
+    record_imports: List[str] = field(default_factory=list)  # local WaterSheep NDJSON; never copied to repo
     per_source_max: int = 5000
     heldout_sources: List[str] = field(default_factory=lambda: [
         "kg:sarcasm", "kg:news_category", "hf:qasc", "kg:phone_reviews"])
@@ -135,8 +137,9 @@ class Config:
 STAGE_KEYS: Dict[str, List[str]] = {
     "env":       [],
     "teacher":   ["llm_model"],
-    "sources":   ["sources", "exclude_sources", "use_kaggle", "per_source_max",
-                  "max_state_chars", "max_option_chars", "max_options", "seed"],
+    "sources":   ["sources", "exclude_sources", "use_public_sources", "use_kaggle",
+                  "record_imports", "per_source_max", "max_state_chars", "max_option_chars",
+                  "max_options", "seed"],
     "audit":     ["audit_per_source", "audit_drop_below_chance"],
     "synth":     ["synth_target", "verify_orders", "verify_min_p",
                   "verify_min_quality", "soft_label_mix", "synth_multi_share", "verify_relabel_conf"],
@@ -177,8 +180,16 @@ def stage_hashes(cfg: Config, order: List[str]) -> Dict[str, str]:
         own = {k: d.get(k) for k in STAGE_KEYS.get(name, [])}
         if name == "sources":
             from ..data.sources import REGISTRY
+            from ..data.imports import fingerprint
             own["_catalog"] = sorted(n if s.version == 1 else "%s@%d" % (n, s.version)
                                      for n, s in REGISTRY.items())
+            imports = []
+            for p in cfg.record_imports:
+                try:
+                    imports.append((p, fingerprint(p)))
+                except OSError:
+                    imports.append((p, None))
+            own["_record_imports"] = imports
         elif name == "build":
             from ..data.corpus import digest
             own["_edits"] = digest()
