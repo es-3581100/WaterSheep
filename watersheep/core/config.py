@@ -64,6 +64,7 @@ class Config:
     score_neighbor_mass: float = 0.15
 
     encoder: str = "answerdotai/ModernBERT-base"
+    init_model: str = ""  # optional WaterSheep export/HF repo used to warm-start all weights
     max_len: int = 512
     max_question_tokens: int = 96
     max_option_tokens: int = 32
@@ -147,7 +148,7 @@ STAGE_KEYS: Dict[str, List[str]] = {
     "build":     ["heldout_sources", "synth_repeat", "val_fraction", "test_fraction",
                   "label_smoothing", "score_neighbor_mass", "seed", "aug_descriptions",
                   "aug_levels", "aug_criteria", "aug_to_multi"],
-    "train":     ["encoder", "max_len", "max_question_tokens", "max_option_tokens",
+    "train":     ["encoder", "init_model", "max_len", "max_question_tokens", "max_option_tokens",
                   "head_layers", "head_dropout", "epochs", "lr", "head_lr",
                   "weight_decay", "warmup_ratio", "min_lr_ratio",
                   "target_batch_examples", "grad_clip", "amp_dtype", "seed"],
