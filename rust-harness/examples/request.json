@@ -1,0 +1,20 @@
+{
+  "state": {
+    "customer": "Priya",
+    "message": "I was charged twice and the package is late."
+  },
+  "questions": {
+    "team": {
+      "type": "choice",
+      "instructions": "Which team should handle this?",
+      "criteria": {
+        "billing": "payments and refunds",
+        "shipping": "delivery problems"
+      }
+    },
+    "escalate": {
+      "type": "noul",
+      "instructions": "Should a human agent take over now?"
+    }
+  }
+}
