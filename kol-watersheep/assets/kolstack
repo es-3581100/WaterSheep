@@ -1,0 +1,548 @@
+#!/usr/bin/env python3
+"""Local KoLmafia/Xpra + Go-supervised WaterSheep + DonCombo bridge launcher.
+
+Only manages processes it started and never invokes a KoL game action.
+"""
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+import fcntl
+import ipaddress
+import json
+import os
+from pathlib import Path
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+ROOT = Path(__file__).resolve().parent
+DEFAULT_XPRA = Path.home() / "repos/es-3581100/kolmafia-xpra"
+DEFAULT_STATE = Path.home() / ".local/state/kolstack-watersheep"
+
+
+def load_config():
+    allowed = {"XPRA_ROOT", "WS_CORE", "WS_KOL", "WS_CONDA_ENV", "WS_USE_CONDA", "WS_PYTHON", "WS_MODEL", "WS_STATE", "WS_STARTUP_TIMEOUT", "WS_DOCKER_GATEWAY", "WS_ADAPTER_MODE", "WS_PREFS_FILE", "WS_TORCH_BACKEND"}
+    config = {}
+    src = ROOT / "config.env"
+    if src.exists():
+        for n, line in enumerate(src.read_text().splitlines(), 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                raise RuntimeError(f"{src}:{n}: expected KEY=VALUE")
+            k, v = line.split("=", 1)
+            if k not in allowed:
+                raise RuntimeError(f"{src}:{n}: unrecognized config key {k!r}")
+            config[k] = v.strip().strip('"').strip("'")
+    config.update({k: os.environ[k] for k in allowed if k in os.environ})
+    xpra = Path(config.get("XPRA_ROOT", str(DEFAULT_XPRA))).expanduser().resolve()
+    config.setdefault("XPRA_ROOT", str(xpra))
+    config.setdefault("WS_CORE", str(xpra / "watersheep" / "watersheep-go-rust-core"))
+    config.setdefault("WS_KOL", str(xpra / "watersheep" / "kol-watersheep"))
+    config.setdefault("WS_CONDA_ENV", "kol-watersheep")
+    config.setdefault("WS_USE_CONDA", "1")
+    config.setdefault("WS_MODEL", "samratduttaofficial/WaterSheep")
+    config.setdefault("WS_STATE", str(DEFAULT_STATE))
+    config.setdefault("WS_STARTUP_TIMEOUT", "600")
+    config.setdefault("WS_ADAPTER_MODE", "dual")
+    config.setdefault("WS_TORCH_BACKEND", "cpu")
+    config.setdefault("WS_PREFS_FILE", str(xpra / "data/settings/doncannoli_prefs.txt"))
+    return config
+
+
+def path(config, key):
+    return Path(config[key]).expanduser().resolve()
+
+
+def run(command, *, cwd=None, capture=False, check=True):
+    print("+", " ".join(map(str, command)), flush=True) if not capture else None
+    return subprocess.run([str(x) for x in command], cwd=cwd, text=True,
+                          stdout=subprocess.PIPE if capture else None,
+                          stderr=subprocess.PIPE if capture else None, check=check)
+
+
+@contextmanager
+def runtime_lock(c):
+    parent = path(c, "WS_STATE")
+    parent.mkdir(parents=True, exist_ok=True)
+    with (parent / "launcher.lock").open("a+b") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError("another kolstack launcher operation is running") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def statefile(c):
+    return path(c, "WS_STATE") / "runtime.json"
+
+
+def get_state(c):
+    f = statefile(c)
+    try:
+        return json.loads(f.read_text())
+    except FileNotFoundError:
+        return {}
+
+
+def save_state(c, data):
+    f = statefile(c)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    tmp = f.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, sort_keys=True, indent=2) + "\n")
+    tmp.replace(f)
+
+
+def start_ticks(pid):
+    try:
+        # Linux proc stat: field 22 (index 19 after the second parenthesis).
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def owned_alive(spec):
+    if not spec:
+        return False
+    pid = spec.get("pid")
+    if not isinstance(pid, int) or pid <= 1 or start_ticks(pid) != spec.get("start_ticks"):
+        return False
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace")
+    except OSError:
+        return False
+    return str(spec.get("identity", "")) in cmdline
+
+
+def kill_owned(spec):
+    import signal
+    if not owned_alive(spec):
+        return
+    pid = spec["pid"]
+    print(f"Stopping owned process {pid} ({spec['identity']})")
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(50):
+        if not owned_alive(spec):
+            return
+        time.sleep(0.1)
+    print(f"WARNING: process {pid} did not stop after SIGTERM; not force-killing it")
+
+
+def spawn(c, identity, cmd, filename):
+    state = path(c, "WS_STATE")
+    state.mkdir(parents=True, exist_ok=True)
+    log = (state / filename).open("ab", buffering=0)
+    try:
+        proc = subprocess.Popen([str(x) for x in cmd], stdout=log, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL, start_new_session=True)
+    finally:
+        log.close()
+    t = start_ticks(proc.pid)
+    if not t:
+        raise RuntimeError("could not record child process start time")
+    return {"pid": proc.pid, "start_ticks": t, "identity": str(identity)}
+
+
+def require_file(p):
+    if not p.is_file():
+        raise RuntimeError(f"Missing {p}; run ./kolstack setup or inspect your clones")
+
+
+def published_adapter_path(c):
+    xpra = path(c, "XPRA_ROOT")
+    candidates = [
+        xpra / "data/git/donCannoli-burns-don_combo-release/scripts/don_combo/watersheep_post_adapter.py",
+        xpra / "data/scripts/don_combo/watersheep_post_adapter.py",
+        xpra / "data/git/donCannoli-burns-don_combo-release/mafia/scripts/don_combo/watersheep_post_adapter.py",
+    ]
+    return next((p for p in candidates if p.is_file()), candidates[0])
+
+
+def adapter_path(c):
+    mode = c.get("WS_ADAPTER_MODE", "dual")
+    if mode == "dual":
+        return ROOT / "compat_adapter.py"
+    if mode == "post_only":
+        return published_adapter_path(c)
+    raise RuntimeError("WS_ADAPTER_MODE must be dual or post_only")
+
+
+def python_exe(c):
+    if c.get("WS_PYTHON"):
+        p = path(c, "WS_PYTHON")
+        require_file(p)
+        return str(p)
+    if c["WS_USE_CONDA"].lower() in {"0", "no", "false"}:
+        return sys.executable
+    if not shutil.which("conda"):
+        raise RuntimeError("Conda not found; install Conda or configure WS_PYTHON in config.env")
+    cp = run(["conda", "run", "-n", c["WS_CONDA_ENV"], "python", "-c",
+              "import sys; print(sys.executable)"], capture=True)
+    exe = cp.stdout.strip().splitlines()[-1] if cp.stdout.strip() else ""
+    if not exe:
+        raise RuntimeError("Could not resolve Conda Python")
+    return exe
+
+
+def torch_cpu_ready(exe):
+    """Only a successfully importable, CUDA-free Torch counts as CPU installed."""
+    check = run([exe, "-c", "import torch; assert torch.version.cuda is None; print(torch.__version__)"],
+                capture=True, check=False)
+    return check.returncode == 0
+
+
+def install_watersheep(c, exe):
+    """Install PyTorch before editable WaterSheep to avoid PyPI CUDA/Triton resolution."""
+    backend = c.get("WS_TORCH_BACKEND", "cpu").lower()
+    if backend not in {"cpu", "existing"}:
+        raise RuntimeError("WS_TORCH_BACKEND must be cpu or existing")
+    pip_opts = [exe, "-m", "pip", "--retries", "10", "--timeout", "120", "install"]
+    if backend == "cpu":
+        if torch_cpu_ready(exe):
+            print("CPU_ONLY_TORCH_READY: reusing installed CPU PyTorch")
+        else:
+            print("Installing official CPU-only PyTorch (no NVIDIA/Triton wheels)")
+            run([*pip_opts, "--upgrade", "--force-reinstall", "torch",
+                 "--index-url", "https://download.pytorch.org/whl/cpu"])
+            if not torch_cpu_ready(exe):
+                raise RuntimeError("PyTorch CPU install did not yield an importable CUDA-free build")
+    else:
+        print("Using existing PyTorch resolver; WS_TORCH_BACKEND=existing can download CUDA/Triton")
+    run([*pip_opts, "-e", str(path(c, "WS_KOL"))])
+    if backend == "cpu" and not torch_cpu_ready(exe):
+        raise RuntimeError("Editable WaterSheep installation changed the CPU-only PyTorch build")
+
+
+def setup(c, skip_pip=False, skip_rust=False):
+    require_file(path(c, "XPRA_ROOT") / "compose.yaml")
+    require_file(path(c, "WS_KOL") / "pyproject.toml")
+    require_file(adapter_path(c))
+    require_file(published_adapter_path(c))
+    core = path(c, "WS_CORE")
+    if not (core / "go-bridge/go.mod").is_file():
+        if core.exists():
+            raise RuntimeError(f"{core} exists but does not contain go-bridge/go.mod; not overwriting it")
+        core.parent.mkdir(parents=True, exist_ok=True)
+        run(["git", "clone", "--branch", "feature/rust-wasm-harness", "--single-branch",
+             "https://github.com/es-3581100/WaterSheep.git", str(core)])
+    if c["WS_USE_CONDA"].lower() not in {"0", "no", "false"} and not c.get("WS_PYTHON"):
+        if not shutil.which("conda"):
+            raise RuntimeError("Conda not found; use WS_PYTHON=/path/to/working/python to reuse an environment")
+        info = json.loads(run(["conda", "env", "list", "--json"], capture=True).stdout)
+        names = {Path(p).name for p in info.get("envs", [])}
+        if c["WS_CONDA_ENV"] not in names:
+            run(["conda", "env", "create", "-n", c["WS_CONDA_ENV"], "-f", str(ROOT / "environment.yml")])
+    exe = python_exe(c)
+    if not skip_pip:
+        install_watersheep(c, exe)
+    if not shutil.which("go"):
+        raise RuntimeError("Go >=1.22 is required to build the existing supervisor")
+    run(["go", "test", "./..."], cwd=core / "go-bridge")
+    binary = path(c, "WS_STATE") / "bin/watersheep-supervisor"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    run(["go", "build", "-o", str(binary), "./cmd/watersheep-supervisor"], cwd=core / "go-bridge")
+    if not skip_rust:
+        if shutil.which("cargo"):
+            run(["cargo", "test", "--manifest-path", str(core / "rust-harness/Cargo.toml")])
+        else:
+            print("Cargo absent: Rust tests skipped. Rust is optional for Combo transport.")
+    print("SETUP COMPLETE. No game actions or KoLmafia preference changes performed.")
+
+
+def http_json(method, url, payload=None, timeout=5):
+    body = None if payload is None else json.dumps(payload).encode()
+    headers = {"Content-Type": "application/json"} if body else {}
+    req = urllib.request.Request(url, data=body, method=method, headers=headers)
+    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=timeout) as res:
+        return res.status, json.load(res)
+
+
+def ready_status(timeout):
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        try:
+            _, s = http_json("GET", "http://127.0.0.1:8777/v1/status", timeout=3)
+            if s.get("owner") != "go-bridge" or s.get("authority") != "observation-only":
+                raise RuntimeError("port 8777 responded, but not with the expected supervisor identity")
+            if s.get("state") == "ready":
+                return s
+            if s.get("state") == "failed":
+                raise RuntimeError(f"WaterSheep supervisor failed: {s.get('last_error')}")
+            last = s.get("state")
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            last = str(exc)
+        time.sleep(0.25)
+    raise RuntimeError(f"WaterSheep supervisor not ready: {last}")
+
+
+def port_open(host, port):
+    try:
+        with socket.create_connection((host, port), timeout=0.25):
+            return True
+    except OSError:
+        return False
+
+
+def compose(c, *args, capture=False):
+    xpra = path(c, "XPRA_ROOT")
+    return run(["docker", "compose", "-f", xpra / "compose.yaml", "--project-directory", xpra, *args],
+               cwd=xpra, capture=capture)
+
+
+def xpra_web_port(c):
+    """Resolve the *published* host port, not an assumed Compose .env default.
+
+    Docker is authoritative here: WEB_PORT can change without modifying this
+    launcher, and an existing container may have been created with a different
+    environment than the current .env file.
+    """
+    result = compose(c, "port", "kolmafia", "8080", capture=True)
+    mappings = result.stdout.strip().splitlines()
+    for mapping in mappings:
+        # Examples: 127.0.0.1:8080, 0.0.0.0:8080, [::1]:8080
+        host, separator, number = mapping.strip().rpartition(":")
+        if separator and host and number.isascii() and number.isdecimal():
+            port = int(number)
+            if 1 <= port <= 65535:
+                return port
+    raise RuntimeError(f"No valid published host port for kolmafia:8080: {mappings!r}")
+
+
+def gateway(c):
+    override = c.get("WS_DOCKER_GATEWAY", "")
+    if override:
+        addr = ipaddress.IPv4Address(override)
+        if not addr.is_private or addr.is_loopback:
+            raise RuntimeError("WS_DOCKER_GATEWAY must be a non-loopback private IPv4 address")
+        return str(addr)
+    cid = compose(c, "ps", "-q", "kolmafia", capture=True).stdout.strip()
+    if not cid:
+        raise RuntimeError("KoLmafia container not running")
+    networks = json.loads(run(["docker", "inspect", "-f", "{{json .NetworkSettings.Networks}}", cid],
+                              capture=True).stdout)
+    for net in networks.values():
+        ip = net.get("Gateway", "")
+        if ip:
+            addr = ipaddress.IPv4Address(ip)
+            if addr.is_private and not addr.is_loopback:
+                return str(addr)
+    raise RuntimeError("Could not determine a private Docker bridge gateway")
+
+
+def wait_adapter(timeout=15):
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        try:
+            _, data = http_json("GET", "http://127.0.0.1:8768/health", timeout=3)
+            if data.get("adapter") == "ready" and data.get("watersheep_tcp") == "listening":
+                return data
+            last = data
+        except (OSError, ValueError) as exc:
+            last = str(exc)
+        time.sleep(0.2)
+    raise RuntimeError(f"adapter failed health check: {last}")
+
+
+def probe(c, addr):
+    # Exact shadow-only envelope accepted by the compatibility adapter;
+    # static non-game fixture, no real KoL coordinate data or game action.
+    payload = {"state": {"mode": "shadow-only; no action authorized", "test": "startup-transport-only"},
+               "questions": {"tile_class": {"type": "choice", "instructions": "Neutral transport check only. Do not select any action.",
+                   "criteria": {k: "neutral non-executable category " + k for k in "ABCDEF"}}}}
+    encoded = urllib.parse.urlencode({"request": json.dumps(payload)})
+    mode = c.get("WS_ADAPTER_MODE", "dual")
+    if mode == "dual":
+        # Test the GET transport actually observed in the user's KoLmafia failure log.
+        req = urllib.request.Request("http://127.0.0.1:8768/v1/kolmafia?" + encoded, method="GET")
+    else:
+        req = urllib.request.Request("http://127.0.0.1:8768/v1/kolmafia", data=encoded.encode("utf-8"),
+            headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST")
+    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=180) as r:
+        result = json.load(r)
+    a = result.get("answers", {}).get("tile_class", {})
+    if not isinstance(a, dict) or not isinstance(a.get("probabilities"), dict) or not set("ABCDEF").issubset(a["probabilities"]):
+        raise RuntimeError("Adapter returned HTTP success but not a complete A-F model score response")
+    # Verify Xpra can reach the adapter over its Docker network.
+    cid = compose(c, "ps", "-q", "kolmafia", capture=True).stdout.strip()
+    cp = run(["docker", "exec", cid, "curl", "--noproxy", "*", "-fsS", "--max-time", "10",
+              f"http://{addr}:8768/health"], capture=True)
+    inside = json.loads(cp.stdout)
+    if inside.get("watersheep_tcp") != "listening":
+        raise RuntimeError("Container can reach adapter, but upstream is not listening")
+    print(f"MODEL_INFERENCE_PASS: A-F scores received by {mode} adapter → Go → Python")
+    print("DOCKER_ADAPTER_PASS: Xpra container reached private host adapter")
+    # Test Xpra (not game.php); use the container's actual published host port.
+    try:
+        port = xpra_web_port(c)
+        url = f"http://127.0.0.1:{port}/xpra/"
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(url, timeout=8) as response:
+            print(f"XPRA_HTTP_PASS: HTTP {response.status} at {url}")
+    except (urllib.error.URLError, subprocess.CalledProcessError, RuntimeError, ValueError) as exc:
+        print(f"XPRA_HTTP_WARNING: {exc}; inspect 'docker compose port kolmafia 8080'")
+    target = f"http://{addr}:8768/v1/kolmafia"
+    print("GCLI SET ONCE:")
+    print(f"  set don_combo_watersheep_endpoint={target}")
+    prefs = path(c, "WS_PREFS_FILE")
+    try:
+        matching = [line.partition("=")[2].strip() for line in prefs.read_text().splitlines()
+                    if line.startswith("don_combo_watersheep_endpoint=")]
+        if matching and matching[-1] == target:
+            print(f"DISK_PREF_MATCH: {prefs} has the expected WaterSheep endpoint")
+        elif matching:
+            print(f"DISK_PREF_WARNING: {prefs} differs; set the endpoint in live gCLI")
+        else:
+            print(f"DISK_PREF_UNKNOWN: no endpoint found in {prefs}; verify in live gCLI")
+    except OSError:
+        print(f"DISK_PREF_UNKNOWN: {prefs} not readable; verify in live gCLI")
+    print("GCLI READ-ONLY CHECK: get don_combo_watersheep_endpoint")
+    print("GCLI READ-ONLY CHECK: doncombo info")
+    print("GCLI READ-ONLY CHECK: don_combo status")
+    print("No Combo runs or beach actions were started.")
+
+
+def up(c, skip_probe=False):
+    state = get_state(c)
+    if owned_alive(state.get("go")) and owned_alive(state.get("adapter")):
+        addr = gateway(c)
+        print("Existing managed processes alive; verifying only.")
+        ready_status(3)
+        wait_adapter()
+        if not skip_probe:
+            probe(c, addr)
+        return
+    if owned_alive(state.get("go")) or owned_alive(state.get("adapter")):
+        raise RuntimeError("Partial prior runtime still alive. Run ./kolstack down, then ./kolstack up.")
+    for p in (8766, 8768, 8777):
+        if port_open("127.0.0.1", p):
+            raise RuntimeError(f"Port {p} already bound by a non-managed process; refusing to start duplicate")
+    core = path(c, "WS_CORE")
+    binary = path(c, "WS_STATE") / "bin/watersheep-supervisor"
+    require_file(binary)
+    require_file(core / "go-bridge/go.mod")
+    adapter = adapter_path(c)
+    require_file(adapter)
+    python = python_exe(c)
+    state = {}
+    try:
+        state["go"] = spawn(c, binary, [binary, "serve", "--python", python,
+            "--model", c["WS_MODEL"], "--listen", "127.0.0.1:8777",
+            "--upstream", "http://127.0.0.1:8766", "--startup-timeout", f"{c['WS_STARTUP_TIMEOUT']}s"], "go-supervisor.log")
+        save_state(c, state)
+        ready_status(float(c["WS_STARTUP_TIMEOUT"]) + 8)
+        compose(c, "up", "-d", "kolmafia")
+        addr = gateway(c)
+        state["adapter"] = spawn(c, adapter, [sys.executable, adapter,
+            "--listen-host", "127.0.0.1", "--listen-host", addr,
+            "--listen-port", "8768", "--watersheep-port", "8777"], "doncombo-adapter.log")
+        state["gateway"] = addr
+        save_state(c, state)
+        wait_adapter()
+        print(f"STACK STARTED: supervisor=127.0.0.1:8777; model=127.0.0.1:8766; adapter=127.0.0.1/{addr}:8768")
+        if not skip_probe:
+            probe(c, addr)
+    except BaseException:
+        print("Startup incomplete. Diagnostics in", path(c, "WS_STATE"), file=sys.stderr)
+        print("Docker/Xpra is not automatically stopped on startup failure.", file=sys.stderr)
+        # Leave managed processes for inspection; ./kolstack down cleans them up.
+        raise
+
+
+def status(c):
+    s = get_state(c)
+    for name in ("go", "adapter"):
+        print(f"{name}: {'RUNNING (managed)' if owned_alive(s.get(name)) else 'NOT MANAGED/RUNNING'}")
+    for port in (8766, 8768, 8777):
+        print(f"host 127.0.0.1:{port} {'listening' if port_open('127.0.0.1', port) else 'closed'}")
+    try:
+        port = xpra_web_port(c)
+        print(f"Xpra HTTP host 127.0.0.1:{port} {'listening' if port_open('127.0.0.1', port) else 'closed'}")
+    except (subprocess.CalledProcessError, RuntimeError, ValueError) as exc:
+        print(f"Xpra HTTP published port unavailable: {exc}")
+    try:
+        _, data = http_json("GET", "http://127.0.0.1:8777/v1/status", timeout=3)
+        print("Go supervisor status:", json.dumps(data, sort_keys=True))
+    except Exception as exc:
+        print("Go supervisor HTTP not available:", exc)
+    try:
+        addr = gateway(c)
+        print("Docker gateway:", addr)
+        print(f"Expected Don Combo endpoint: http://{addr}:8768/v1/kolmafia")
+    except Exception as exc:
+        print("Docker gateway unavailable:", exc)
+    print("Runtime logs:", path(c, "WS_STATE"))
+
+
+def down(c, with_xpra=False):
+    s = get_state(c)
+    kill_owned(s.get("adapter"))
+    kill_owned(s.get("go"))
+    save_state(c, {})
+    if with_xpra:
+        compose(c, "stop", "kolmafia")
+    print("WaterSheep-managed processes stopped; Xpra", "stopped" if with_xpra else "left as-is")
+
+
+def rust_check(c):
+    core = path(c, "WS_CORE")
+    require_file(core / "rust-harness/Cargo.toml")
+    require_file(core / "rust-harness/examples/request.json")
+    if not shutil.which("cargo"):
+        raise RuntimeError("cargo is not installed")
+    ready_status(5)
+    output = path(c, "WS_STATE") / "rust-readonly-receipt.json"
+    run(["cargo", "run", "--manifest-path", core / "rust-harness/Cargo.toml", "--", "ask",
+         "--base-url", "http://127.0.0.1:8777",
+         "--request", core / "rust-harness/examples/request.json", "--out", output])
+    receipt = json.loads(output.read_text())
+    if receipt.get("authority") != "evidence-only":
+        raise RuntimeError("Rust receipt authority not evidence-only")
+    print(f"RUST_RECEIPT_PASS: {output}")
+    print("This is an independent harness check; DonCombo does not automatically invoke Rust receipts.")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    sub = ap.add_subparsers(dest="action", required=True)
+    p = sub.add_parser("setup", help="create optional Conda env, install KoL fork, build Go/Rust")
+    p.add_argument("--skip-pip", action="store_true")
+    p.add_argument("--skip-rust", action="store_true")
+    p = sub.add_parser("up", help="start model, Docker/Xpra, private adapter and verify")
+    p.add_argument("--skip-probe", action="store_true", help="only check readiness/socket, not inference")
+    sub.add_parser("status", help="inspect local stack; no KoL actions")
+    p = sub.add_parser("down", help="stop only managed processes")
+    p.add_argument("--with-xpra", action="store_true", help="also stop Docker/Xpra")
+    sub.add_parser("rust-check", help="request one generic evidence-only Rust receipt")
+    a = ap.parse_args()
+    c = load_config()
+    try:
+        if a.action == "status":
+            status(c)
+        elif a.action == "rust-check":
+            rust_check(c)
+        else:
+            with runtime_lock(c):
+                if a.action == "setup":
+                    setup(c, a.skip_pip, a.skip_rust)
+                elif a.action == "up":
+                    up(c, a.skip_probe)
+                elif a.action == "down":
+                    down(c, a.with_xpra)
+        return 0
+    except (RuntimeError, OSError, subprocess.CalledProcessError, ValueError, urllib.error.URLError) as exc:
+        print(f"KOLSTACK_ERROR: {exc}", file=sys.stderr)
+        return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
