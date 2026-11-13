@@ -95,6 +95,37 @@ def unit_tests():
     check(not d.seen({"state": "Completely different text about payroll dates and taxes.",
                       "question": "Is it late?"}), "dedup keeps different text")
 
+    from watersheep.data.semantic import graph_records
+    from watersheep.data.imports import load_records
+    nodes = [
+        {"id": "a", "title": "Alpha", "cluster": "x", "summary": "first concept"},
+        {"id": "b", "title": "Beta", "cluster": "x", "summary": "second concept"},
+        {"id": "c", "title": "Gamma", "cluster": "x", "summary": "third concept"},
+        {"id": "d", "title": "Delta", "cluster": "x", "summary": "fourth concept"},
+    ]
+    sem = graph_records(nodes, [{"id": "e1", "source": "a", "target": "b",
+                                 "relation": "maps_to", "kind": "verified"}],
+                        cfg, negatives=2, seed=7, source_name="selftest")
+    check(len(sem) == 1 and validate(sem[0])[0] and
+          sem[0]["options"][sem[0]["answer"]] == "Beta",
+          "semantic graph edge -> valid WaterSheep relation-completion record")
+    HOME.mkdir(parents=True, exist_ok=True)
+    imp = HOME / "semantic-records.jsonl"
+    imp.write_text(__import__("json").dumps(sem[0]) + "\n", encoding="utf-8")
+    loaded = load_records(str(imp), cfg)
+    check(len(loaded) == 1 and loaded[0]["id"].startswith("sem:e1-"),
+          "strict local record import accepts valid semantic NDJSON")
+    cfg_no_public = Config(use_public_sources=False)
+    check(S.enabled(cfg_no_public) == [], "public dataset loading can be disabled for local-only training")
+    bad = HOME / "bad-semantic-records.jsonl"
+    bad.write_text('{"type":"choice"}\n', encoding="utf-8")
+    rejected = False
+    try:
+        load_records(str(bad), cfg)
+    except ValueError:
+        rejected = True
+    check(rejected, "strict local record import rejects invalid WaterSheep NDJSON")
+
 
 def watch_and_stop(step: int):
     """Request a stop once training passes `step`."""
@@ -206,6 +237,29 @@ def pipeline(real_teacher: bool):
     check(len(a["big"]["probabilities"]) == 40 and abs(sum(a["big"]["probabilities"].values()) - 1) < 1e-3,
           "40-label choice via tournament")
     check("error" in a["bad"], "invalid question reports an error instead of failing the request")
+
+    # The fact that decides the answer sits just past the input limit: it must not reach the model,
+    # and the answer has to say that text was dropped.
+    from watersheep.model import encode_records
+    m = ws.meta
+    q, opts = "Ship it?", ["yes", "no"]
+    fact = " Correction: the warehouse is empty."
+    short = "Stock: 50 cables."
+    long = short + " Note for the file." * (m["max_len"] // 4)
+
+    def ids(state):
+        rec = {"type": "binary", "state": state, "question": q, "options": opts}
+        return next(encode_records(ws.tok, [rec], m["max_len"], m["max_question_tokens"],
+                                   m["max_option_tokens"]))[0]
+    s0, s1 = ws.decide(short, q, opts), ws.decide(short + fact, q, opts)
+    l0, l1 = ws.decide(long, q, opts), ws.decide(long + fact, q, opts)
+    check("truncated" not in s0 and "truncated" not in s1 and ids(short) != ids(short + fact),
+          "a deciding fact inside the input limit reaches the model")
+    check(l0.get("truncated") is True and l1.get("truncated") is True and
+          ids(long) == ids(long + fact) and l0["probs"] == l1["probs"],
+          "a deciding fact past the input limit changes nothing, and the answer is marked truncated")
+    res = ws.ask({"state": long + fact, "questions": {"ship": {"type": "noul", "instructions": q}}})
+    check(res["answers"]["ship"].get("truncated") is True, "ask marks a truncated answer")
 
     before = syn.get("accepted", 0)
     if not real_teacher:

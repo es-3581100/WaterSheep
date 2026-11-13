@@ -28,6 +28,7 @@ from watersheep.core.paths import P                                           # 
 from watersheep.core.util import read_json                                    # noqa: E402
 
 TEMPLATE = Path(__file__).resolve().parent / "model_card.md"
+VIDEO = "https://youtu.be/VjSiBecOiRI"
 HF_CODE = ROOT / "huggingface"
 IN_TRAINING = {"no": "no", "YES - same split": "same split", "other split only": "other split"}
 ONNX = "onnx/model_quantized.onnx"
@@ -35,6 +36,9 @@ PUBLISH_FILES = HUB_FILES + ["onnx/*"]
 FIGURES = {
     "reliability": ("Calibration by question type",
                     "Accuracy against confidence for each question type, before (raw) and after calibration."),
+    "coverage": ("Error against coverage",
+                 "Error among the questions answered when the model only answers above a confidence "
+                 "threshold. The dots mark thresholds of 0.70, 0.90 and 0.97."),
     "training": ("Training curves",
                  "Training loss and learning rate (left); validation accuracy by question type (right)."),
     "synth": ("Synthetic data verification",
@@ -107,7 +111,7 @@ def online(repo: str, url: str) -> Tuple[str, str, bool]:
 
 
 def header(title: str, site: str, space: str, url: str) -> str:
-    links = " · ".join("[%s](%s)" % (k, v) for k, v in (("Website", site), ("Demo", space), ("Code", url)) if v)
+    links = " · ".join("[%s](%s)" % (k, v) for k, v in (("Website", site), ("Demo", space), ("Code", url), ("Video", VIDEO)) if v)
     if not site:
         return "# %s\n\n%s" % (title, links)
     return "![%s](%sbanner.svg)\n\n# ![](%slogo.svg) %s\n\n%s" % (title, site, site, title, links)
@@ -228,7 +232,7 @@ def render_card(repo: str, meta: dict, d: Path, a) -> str:
         "header": header(title, site, space, url),
         "javascript": js_block(site, title, (d / ONNX).exists() or remote_onnx),
         "metrics": metrics_table(meta), "benchmarks": bench_table(meta["name"]),
-        "calibration": figure(site, "reliability"),
+        "calibration": "%s\n\n%s" % (figure(site, "reliability"), figure(site, "coverage")) if site else "",
         "training": "## Training\n\n%s\n\n%s" % (figure(site, "training"), figure(site, "synth")) if site else "",
         "author": author(), "year": str(meta.get("created") or time.strftime("%Y"))[:4],
     }
