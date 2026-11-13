@@ -20,13 +20,23 @@ dependencies = [
     "safetensors>=0.4",
     "huggingface_hub>=0.34",
 ]
-keywords = ["decision model", "classification", "zero-shot", "calibration"]
+keywords = ["decision model", "classification", "zero-shot", "calibration", "langchain", "llamaindex"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
     "Intended Audience :: Developers",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+
+[project.optional-dependencies]
+langchain = ["langchain-core>=0.3"]
+llamaindex = ["llama-index-core>=0.12"]
+
+[project.urls]
+Homepage = "https://samratduttaofficial.github.io/WaterSheep/"
+Source = "https://github.com/SamratDuttaOfficial/WaterSheep"
+Model = "https://huggingface.co/samratduttaofficial/WaterSheep"
+Issues = "https://github.com/SamratDuttaOfficial/WaterSheep/issues"
 
 [project.scripts]
 watersheep = "watersheep.cli:main"
